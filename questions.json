@@ -1,0 +1,12 @@
+[
+    {
+        "category": "GreekLetterLowercaseToName",
+        "prompt": "What is α?",
+        "trueAnswer": "alpha"
+    },
+    {
+        "category": "GreekLetterLowercaseToName",
+        "prompt": "What is β?",
+        "trueAnswer": "beta"
+    }
+]
