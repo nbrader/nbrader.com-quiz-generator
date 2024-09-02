@@ -1,13 +1,13 @@
 module Main exposing (..)
 
 import Browser
-import Html exposing (Html, button, div, input, text)
+import Html exposing (Html, button, div, input, text, table, tr, td, th)
 import Html.Attributes exposing (type_, placeholder, value)
 import Html.Events exposing (onClick, onInput)
-import List.Extra exposing (getAt)
 import Json.Decode as Decode
 import Json.Decode.Pipeline exposing (required)
 import Http
+import Random
 
 
 -- MODEL
@@ -18,40 +18,56 @@ type alias Question =
     , trueAnswer : String
     }
 
+type alias AnsweredQuestion =
+    { question : Question
+    , userAnswer : String
+    , isCorrect : Bool
+    }
+
 type Category
     = GreekLetterLowercaseToName
 
-type Msg
-    = StartQuiz
-    | AnswerSelected String
-    | NextQuestion
-    | ConfirmCorrectness Bool
-    | LoadQuestions (Result Http.Error (List Question))
-
 type alias Model =
-    { questions : List Question
-    , currentQuestionIndex : Int
-    , userAnswers : List String
+    { remainingQuestions : List Question
+    , currentQuestion : Maybe Question
+    , answeredQuestions : List AnsweredQuestion
     , score : Int
     , quizStarted : Bool
     , quizFinished : Bool
     , answerInput : String
-    , showCorrectnessCheck : Bool
-    , correctAnswer : Maybe String
+    , randomThreshold : Float
+    , lastFocusedIndex : Maybe Int
+    , randomSeed : Random.Seed
     }
 
+type Msg
+    = StartQuiz
+    | AnswerSelected String
+    | SubmitAnswer
+    | ConfirmCorrectness Bool
+    | LoadQuestions (Result Http.Error (List Question))
+    | PickQuestion
+    | EndQuiz
+    | RandomGenerated Float
+
+
+-- INITIALIZATION
 
 init : () -> (Model, Cmd Msg)
 init _ =
-    ( { questions = []
-      , currentQuestionIndex = 0
-      , userAnswers = []
+    let
+        seed = Random.initialSeed 42
+    in
+    ( { remainingQuestions = []
+      , currentQuestion = Nothing
+      , answeredQuestions = []
       , score = 0
       , quizStarted = False
       , quizFinished = False
       , answerInput = ""
-      , showCorrectnessCheck = False
-      , correctAnswer = Nothing
+      , randomThreshold = 0.5 -- Define your threshold here
+      , lastFocusedIndex = Nothing
+      , randomSeed = seed
       }
     , loadQuestions
     )
@@ -59,42 +75,110 @@ init _ =
 
 -- UPDATE
 
+-- Split the list manually without using `List.splitAt`
+splitAtIndex : Int -> List a -> (Maybe a, List a)
+splitAtIndex index list =
+    let
+        -- Recursive function to traverse the list
+        splitHelper currentIndex remaining acc =
+            case remaining of
+                [] ->
+                    -- If we reach the end, return Nothing and the original list
+                    (Nothing, List.reverse acc)
+
+                x :: xs ->
+                    if currentIndex == index then
+                        -- If the current index matches the desired index, return the element and the rest of the list
+                        (Just x, List.reverse acc ++ xs)
+                    else
+                        -- Otherwise, keep traversing
+                        splitHelper (currentIndex + 1) xs (x :: acc)
+    in
+    splitHelper 0 list []
+
+-- Usage in the `update` function
 update : Msg -> Model -> (Model, Cmd Msg)
 update msg model =
     case msg of
         StartQuiz ->
-            ({ model | quizStarted = True, quizFinished = False, currentQuestionIndex = 0, userAnswers = [], score = 0, answerInput = "", showCorrectnessCheck = False, correctAnswer = Nothing }, Cmd.none)
+            if List.isEmpty model.remainingQuestions then
+                -- No questions to load, stop the quiz
+                (model, Cmd.none)
+            else
+                -- Start the quiz by picking the first question
+                ({ model | quizStarted = True, quizFinished = False }, pickQuestionCmd model)
 
         AnswerSelected answer ->
             ({ model | answerInput = answer }, Cmd.none)
 
-        NextQuestion ->
-            let
-                currentQuestion = List.Extra.getAt model.currentQuestionIndex model.questions
-            in
-            case currentQuestion of
+        SubmitAnswer ->
+            case model.currentQuestion of
                 Just q ->
-                    ({ model | showCorrectnessCheck = True, correctAnswer = Just q.trueAnswer }, Cmd.none)
+                    let
+                        answered = { question = q, userAnswer = model.answerInput, isCorrect = q.trueAnswer == model.answerInput }
+                        updatedAnswers = model.answeredQuestions ++ [answered]
+                    in
+                    ({ model | answeredQuestions = updatedAnswers, answerInput = "", currentQuestion = Nothing }, pickQuestionCmd model)
+
                 Nothing ->
                     (model, Cmd.none)
 
-        ConfirmCorrectness correct ->
-            let
-                updatedScore = if correct then model.score + 1 else model.score
-                newModel =
-                    if model.currentQuestionIndex < List.length model.questions - 1 then
-                        { model | currentQuestionIndex = model.currentQuestionIndex + 1, answerInput = "", showCorrectnessCheck = False, correctAnswer = Nothing, score = updatedScore }
-                    else
-                        { model | quizStarted = False, quizFinished = True, score = updatedScore }
-            in
-            (newModel, Cmd.none)
+        ConfirmCorrectness _ ->
+            (model, Cmd.none)
 
         LoadQuestions (Ok questions) ->
-            ({ model | questions = questions }, Cmd.none)
+            ({ model | remainingQuestions = questions }, Cmd.none)
 
         LoadQuestions (Err _) ->
             -- Handle error, e.g., by showing a message to the user
             (model, Cmd.none)
+
+        PickQuestion ->
+            let
+                isEmpty = List.isEmpty model.remainingQuestions
+            in
+            if isEmpty then
+                ({ model | quizFinished = True, quizStarted = False }, Cmd.none)
+            else
+                (model, Random.generate RandomGenerated (Random.float 0 1))
+
+        RandomGenerated value ->
+            let
+                lastIndex = List.length model.remainingQuestions - 1
+                nextIndex =
+                    case model.lastFocusedIndex of
+                        Just i ->
+                            if i >= lastIndex then
+                                0
+                            else
+                                i + 1
+
+                        Nothing ->
+                            0
+
+                (maybeFocusedQuestion, remaining) = splitAtIndex nextIndex model.remainingQuestions
+                isSelected = value < model.randomThreshold
+            in
+            case maybeFocusedQuestion of
+                Just focusedQuestion ->
+                    if isSelected then
+                        ({ model
+                           | currentQuestion = Just focusedQuestion
+                           , remainingQuestions = remaining
+                           , lastFocusedIndex = Just nextIndex
+                         }, Cmd.none)
+                    else
+                        ({ model | lastFocusedIndex = Just nextIndex }, pickQuestionCmd model)
+
+                Nothing ->
+                    -- Fallback in case of any unexpected errors
+                    (model, Cmd.none)
+
+        EndQuiz ->
+            ({ model | quizFinished = True, quizStarted = False }, Cmd.none)
+
+
+
 
 
 -- VIEW
@@ -103,36 +187,41 @@ view : Model -> Html Msg
 view model =
     div []
         [ if model.quizStarted then
-            case List.Extra.getAt model.currentQuestionIndex model.questions of
+            case model.currentQuestion of
                 Just question ->
                     div []
                         [ div [] [ text question.prompt ]
-                        , if model.showCorrectnessCheck then
-                            div []
-                                [ div [] [ text ("Correct answer: " ++ Maybe.withDefault "" model.correctAnswer) ]
-                                , div [] [ text ("Your answer: " ++ model.answerInput) ]
-                                , button [ onClick (ConfirmCorrectness True) ] [ text "I got it right" ]
-                                , button [ onClick (ConfirmCorrectness False) ] [ text "I got it wrong" ]
-                                ]
-                          else
-                            div []
-                                [ input [ type_ "text", placeholder "Your answer", value model.answerInput, onInput AnswerSelected ] []
-                                , button [ onClick NextQuestion ] [ text "Submit" ]
-                                ]
+                        , input [ type_ "text", placeholder "Your answer", value model.answerInput, onInput AnswerSelected ] []
+                        , button [ onClick SubmitAnswer ] [ text "Submit" ]
+                        , button [ onClick EndQuiz ] [ text "End Quiz" ]
                         ]
                 Nothing ->
                     text "Loading question..."
-          else
+          else if model.quizFinished then
             div []
-                [ if model.quizFinished then
-                    div []
-                        [ text "Quiz Finished! "
-                        , div [] [ text ("Your score: " ++ String.fromInt model.score ++ "/" ++ String.fromInt (List.length model.questions)) ]
-                        , button [ onClick StartQuiz ] [ text "Restart Quiz" ]
-                        ]
-                  else
-                    button [ onClick StartQuiz ] [ text "Start Quiz" ]
+                [ text "Quiz Finished! "
+                , div [] [ text ("Your score: " ++ String.fromInt model.score ++ "/" ++ String.fromInt (List.length model.answeredQuestions)) ]
+                , viewResults model.answeredQuestions
+                , button [ onClick StartQuiz ] [ text "Restart Quiz" ]
                 ]
+          else
+            button [ onClick StartQuiz ] [ text "Start Quiz" ]
+        ]
+
+
+viewResults : List AnsweredQuestion -> Html msg
+viewResults answeredQuestions =
+    table []
+        (List.map viewResultRow answeredQuestions)
+
+
+viewResultRow : AnsweredQuestion -> Html msg
+viewResultRow answeredQuestion =
+    tr []
+        [ td [] [ text answeredQuestion.question.prompt ]
+        , td [] [ text answeredQuestion.userAnswer ]
+        , td [] [ text answeredQuestion.question.trueAnswer ]
+        , td [] [ text (if answeredQuestion.isCorrect then "Correct" else "Incorrect") ]
         ]
 
 
@@ -141,7 +230,7 @@ view model =
 loadQuestions : Cmd Msg
 loadQuestions =
     Http.get
-        { url = "/questions.json"
+        { url = "questions.json"
         , expect = Http.expectJson LoadQuestions questionsDecoder
         }
 
@@ -165,7 +254,13 @@ categoryDecoder str =
             Decode.fail ("Unknown category: " ++ str)
 
 
--- MAIN
+-- HELPERS
+
+pickQuestionCmd : Model -> Cmd Msg
+pickQuestionCmd model =
+    Cmd.batch
+        [ Random.generate RandomGenerated (Random.float 0 1)
+        ]
 
 main : Program () Model Msg
 main =
