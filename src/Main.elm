@@ -8,6 +8,8 @@ import Json.Decode as Decode
 import Json.Decode.Pipeline exposing (required)
 import Http
 import Random
+import Debug
+import Task
 
 
 -- MODEL
@@ -35,20 +37,20 @@ type alias Model =
     , quizStarted : Bool
     , quizFinished : Bool
     , answerInput : String
-    , randomThreshold : Float
+    , selectionChancePerTry : Float
     , lastFocusedIndex : Maybe Int
     , randomSeed : Random.Seed
     }
 
 type Msg
     = StartQuiz
-    | AnswerSelected String
+    | AnswerUpdated String
     | SubmitAnswer
     | ConfirmCorrectness Bool
     | LoadQuestions (Result Http.Error (List Question))
-    | PickQuestion
+    -- | PickQuestion
     | EndQuiz
-    | RandomGenerated Float
+    | PickQuestion Float
 
 
 -- INITIALIZATION
@@ -65,7 +67,7 @@ init _ =
       , quizStarted = False
       , quizFinished = False
       , answerInput = ""
-      , randomThreshold = 0.5 -- Define your threshold here
+      , selectionChancePerTry = 0.1 -- Define your threshold here
       , lastFocusedIndex = Nothing
       , randomSeed = seed
       }
@@ -75,48 +77,22 @@ init _ =
 
 -- UPDATE
 
--- Split the list manually without using `List.splitAt`
-splitAtIndex : Int -> List a -> (Maybe a, List a)
-splitAtIndex index list =
-    let
-        -- Recursive function to traverse the list
-        splitHelper currentIndex remaining acc =
-            case remaining of
-                [] ->
-                    -- If we reach the end, return Nothing and the original list
-                    (Nothing, List.reverse acc)
-
-                x :: xs ->
-                    if currentIndex == index then
-                        -- If the current index matches the desired index, return the element and the rest of the list
-                        (Just x, List.reverse acc ++ xs)
-                    else
-                        -- Otherwise, keep traversing
-                        splitHelper (currentIndex + 1) xs (x :: acc)
-    in
-    splitHelper 0 list []
-
 -- Usage in the `update` function
 update : Msg -> Model -> (Model, Cmd Msg)
 update msg model =
     case msg of
         StartQuiz ->
-            if List.isEmpty model.remainingQuestions then
-                -- No questions to load, stop the quiz
-                (model, Cmd.none)
-            else
-                -- Start the quiz by picking the first question
-                ({ model | quizStarted = True, quizFinished = False }, pickQuestionCmd model)
+            ({ model | quizStarted = True, quizFinished = False }, Cmd.batch [loadQuestions, pickQuestionCmd model])
 
-        AnswerSelected answer ->
+        AnswerUpdated answer ->
             ({ model | answerInput = answer }, Cmd.none)
 
         SubmitAnswer ->
             case model.currentQuestion of
                 Just q ->
                     let
-                        answered = { question = q, userAnswer = model.answerInput, isCorrect = q.trueAnswer == model.answerInput }
-                        updatedAnswers = model.answeredQuestions ++ [answered]
+                        answer = { question = q, userAnswer = model.answerInput, isCorrect = q.trueAnswer == model.answerInput }
+                        updatedAnswers = model.answeredQuestions ++ [answer]
                     in
                     ({ model | answeredQuestions = updatedAnswers, answerInput = "", currentQuestion = Nothing }, pickQuestionCmd model)
 
@@ -131,18 +107,19 @@ update msg model =
 
         LoadQuestions (Err _) ->
             -- Handle error, e.g., by showing a message to the user
-            (model, Cmd.none)
+            ({ model | remainingQuestions = [] }, Cmd.none)
 
-        PickQuestion ->
-            let
-                isEmpty = List.isEmpty model.remainingQuestions
-            in
-            if isEmpty then
-                ({ model | quizFinished = True, quizStarted = False }, Cmd.none)
-            else
-                (model, Random.generate RandomGenerated (Random.float 0 1))
+        -- PickQuestion ->
+            -- let
+                -- isEmpty = List.isEmpty model.remainingQuestions
+            -- in
+            -- if isEmpty then
+                -- -- No more questions left, mark the quiz as finished
+                -- ({ model | quizFinished = True, quizStarted = False, currentQuestion = Nothing }, Cmd.none)
+            -- else
+                -- (model, Random.generate PickQuestion (Random.float 0 1))
 
-        RandomGenerated value ->
+        PickQuestion randomValue ->
             let
                 lastIndex = List.length model.remainingQuestions - 1
                 nextIndex =
@@ -156,29 +133,26 @@ update msg model =
                         Nothing ->
                             0
 
-                (maybeFocusedQuestion, remaining) = splitAtIndex nextIndex model.remainingQuestions
-                isSelected = value < model.randomThreshold
+                (maybeFocusedQuestion, remaining) = popIndex lastIndex model.remainingQuestions
+                isSelected = randomValue < model.selectionChancePerTry
             in
-            case maybeFocusedQuestion of
+            case Debug.log ("randomValue : " ++ String.fromFloat randomValue ++ ", isSelected : " ++ (if isSelected then "True" else "False") ++ ", remaining : [" ++ String.join "," (List.map (\q -> q.prompt) remaining) ++ "], " ++ "maybeFocusedQuestion") maybeFocusedQuestion of
                 Just focusedQuestion ->
                     if isSelected then
                         ({ model
                            | currentQuestion = Just focusedQuestion
                            , remainingQuestions = remaining
-                           , lastFocusedIndex = Just nextIndex
+                           , lastFocusedIndex = Just lastIndex
                          }, Cmd.none)
                     else
                         ({ model | lastFocusedIndex = Just nextIndex }, pickQuestionCmd model)
 
                 Nothing ->
                     -- Fallback in case of any unexpected errors
-                    (model, Cmd.none)
+                    Debug.log "case maybeFocusedQuestion of Nothing" (model, endQuizCmd model)
 
         EndQuiz ->
-            ({ model | quizFinished = True, quizStarted = False }, Cmd.none)
-
-
-
+            ({ model | quizFinished = True, quizStarted = False, currentQuestion = Nothing }, Cmd.none)
 
 
 -- VIEW
@@ -191,7 +165,7 @@ view model =
                 Just question ->
                     div []
                         [ div [] [ text question.prompt ]
-                        , input [ type_ "text", placeholder "Your answer", value model.answerInput, onInput AnswerSelected ] []
+                        , input [ type_ "text", placeholder "Your answer", value model.answerInput, onInput AnswerUpdated ] []
                         , button [ onClick SubmitAnswer ] [ text "Submit" ]
                         , button [ onClick EndQuiz ] [ text "End Quiz" ]
                         ]
@@ -247,20 +221,55 @@ questionDecoder =
 
 categoryDecoder : String -> Decode.Decoder Category
 categoryDecoder str =
-    case str of
-        "GreekLetterLowercaseToName" ->
-            Decode.succeed GreekLetterLowercaseToName
-        _ ->
+    case stringToCategory str of
+        Just category ->
+            Decode.succeed category
+        Nothing ->
             Decode.fail ("Unknown category: " ++ str)
+
+stringToCategory : String -> Maybe Category
+stringToCategory str =
+    case str of
+        "GreekLetterLowercaseToName" -> Just GreekLetterLowercaseToName
+        _ -> Nothing
+
+categoryToString : Category -> String
+categoryToString category =
+    case category of
+        GreekLetterLowercaseToName -> "GreekLetterLowercaseToName"
 
 
 -- HELPERS
 
+-- Split the list manually without using `List.splitAt`
+popIndex : Int -> List a -> (Maybe a, List a)
+popIndex index list =
+    let
+        -- Recursive function to traverse the list
+        popHelper currentIndex remaining acc =
+            case remaining of
+                [] ->
+                    -- If we reach the end, return Nothing and the original list
+                    (Nothing, List.reverse acc)
+
+                x :: xs ->
+                    if currentIndex == index then
+                        -- If the current index matches the desired index, return the element and the rest of the list
+                        (Just x, List.reverse acc ++ xs)
+                    else
+                        -- Otherwise, keep traversing
+                        popHelper (currentIndex + 1) xs (x :: acc)
+    in
+    popHelper 0 list []
+
 pickQuestionCmd : Model -> Cmd Msg
 pickQuestionCmd model =
     Cmd.batch
-        [ Random.generate RandomGenerated (Random.float 0 1)
+        [ Random.generate PickQuestion (Random.float 0 1)
         ]
+
+endQuizCmd : Model -> Cmd Msg
+endQuizCmd model = Task.succeed () |> Task.perform (\_ -> EndQuiz)
 
 main : Program () Model Msg
 main =
